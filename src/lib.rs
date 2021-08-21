@@ -1,13 +1,13 @@
 #![no_std]
 
+use core::ffi::c_void;
 use core::mem::{align_of, size_of, MaybeUninit};
+
+#[cfg(test)]
+mod tests;
 
 /// Allocates `[u8;size]` memory on stack and invokes `closure` with this slice as argument.
 ///
-///
-/// # Safety
-/// This function is safe because `c_with_alloca` (which is internally used) will always returns non-null
-/// pointer.
 ///
 /// # Potential segfaults or UB
 ///
@@ -21,68 +21,160 @@ use core::mem::{align_of, size_of, MaybeUninit};
 ///
 ///
 ///
-#[allow(nonstandard_style)]
-pub fn with_alloca<R, F>(size: usize, f: F) -> R
+#[inline]
+pub fn with_raw<R, F>(size: usize, f: F) -> R
+where
+    F: FnOnce(*mut u8) -> R,
+{
+    type Callback = unsafe extern "C" fn(ptr: *mut u8, data: *mut c_void);
+    extern "C" {
+        fn c_with_alloca(size: usize, cb: Callback, data: *mut c_void);
+    }
+
+    let mut f = Some(f);
+    let mut ret = None::<R>;
+
+    let ref mut f = |ptr: *mut u8| {
+        ret = Some(f.take().unwrap()(ptr));
+    };
+
+    #[inline(always)]
+    fn with_fn_of_val<F>(_: &mut F) -> Callback
+    where
+        F: FnMut(*mut u8),
+    {
+        unsafe extern "C" fn trampoline<F: FnMut(*mut u8)>(ptr: *mut u8, data: *mut c_void) {
+            (&mut *data.cast::<F>())(ptr);
+        }
+
+        trampoline::<F>
+    }
+
+    // SAFETY: The function `c_with_alloca` will always return a valid pointer.
+    unsafe {
+        c_with_alloca(size, with_fn_of_val(f), <*mut _>::cast::<c_void>(f));
+    }
+
+    ret.unwrap()
+}
+
+#[inline]
+pub fn with_bytes<R, F>(size: usize, f: F) -> R
 where
     F: FnOnce(&mut [MaybeUninit<u8>]) -> R,
 {
-    unsafe {
-        use ::core::ffi::c_void;
-        type cb_t = unsafe extern "C" fn(ptr: *mut u8, data: *mut c_void);
-        extern "C" {
-
-            fn c_with_alloca(size: usize, cb: cb_t, data: *mut c_void);
-        }
-        let mut f = Some(f);
-        let mut ret = None::<R>;
-        // &mut (impl FnMut(*mut u8))
-        let ref mut f = |ptr: *mut u8| {
-            let slice = ::core::slice::from_raw_parts_mut(ptr.cast::<MaybeUninit<u8>>(), size);
-
-            ret = Some(f.take().unwrap()(slice));
-        };
-        #[inline(always)]
-        fn with_F_of_val<F>(_: &mut F) -> cb_t
-        where
-            F: FnMut(*mut u8),
-        {
-            unsafe extern "C" fn trampoline<F: FnMut(*mut u8)>(ptr: *mut u8, data: *mut c_void) {
-                (&mut *data.cast::<F>())(ptr);
-            }
-
-            trampoline::<F>
-        }
-
-        c_with_alloca(size, with_F_of_val(f), <*mut _>::cast::<c_void>(f));
-
-        ret.unwrap()
-    }
+    crate::with_raw(size, |ptr| {
+        let slice = unsafe { core::slice::from_raw_parts_mut(ptr as *mut MaybeUninit<u8>, size) };
+        f(slice)
+    })
 }
 
-/// Same as `with_alloca` except it zeroes memory slice.
-pub fn with_alloca_zeroed<R, F>(size: usize, f: F) -> R
+#[inline]
+pub fn with_bytes_zeroed<R, F>(size: usize, f: F) -> R
 where
     F: FnOnce(&mut [u8]) -> R,
 {
-    with_alloca(size, |memory| unsafe {
-        core::ptr::write_bytes(memory.as_mut_ptr().cast::<u8>(), 0, size);
-        f(core::mem::transmute(memory))
+    crate::with_bytes(size, |slice| {
+        let slice = unsafe { &mut *(slice as *mut [MaybeUninit<u8>] as *mut [u8]) };
+        slice.fill(0);
+        f(slice)
+    })
+}
+
+#[inline]
+pub fn with_slice<T, R, F>(count: usize, f: F) -> R
+where
+    F: FnOnce(&mut [MaybeUninit<T>]) -> R,
+{
+    let size = count * size_of::<T>() + align_of::<T>() - 1;
+    with_raw(size, |memory| {
+        let mut raw_memory = memory as *mut MaybeUninit<T>;
+
+        // ensure each element is properly aligned
+        let offset = raw_memory as usize % align_of::<T>();
+        if offset != 0 {
+            raw_memory = unsafe { raw_memory.add(align_of::<T>() - offset) };
+        }
+
+        let slice = unsafe { core::slice::from_raw_parts_mut(raw_memory, count) };
+
+        f(slice)
+    })
+}
+
+#[inline]
+pub fn with_slice_zeroed<T, R, F>(count: usize, f: F) -> R
+where
+    F: FnOnce(&mut [MaybeUninit<T>]) -> R,
+{
+    with_slice(count, |slice| {
+        unsafe {
+            core::ptr::write_bytes(slice.as_mut_ptr(), 0, count);
+        }
+
+        f(slice)
+    })
+}
+
+#[inline]
+pub unsafe fn with_slice_assume_init<T, R, F>(count: usize, f: F) -> R
+where
+    F: FnOnce(&mut [T]) -> R,
+{
+    with_slice(count, |slice| {
+        let slice = unsafe { &mut *(slice as *mut [MaybeUninit<T>] as *mut [T]) };
+        f(slice)
+    })
+}
+
+#[inline]
+pub unsafe fn with_slice_zeroed_assume_init<T, R, F>(count: usize, f: F) -> R
+where
+    F: FnOnce(&mut [T]) -> R,
+{
+    with_slice_zeroed(count, |slice| {
+        let slice = unsafe { &mut *(slice as *mut [MaybeUninit<T>] as *mut [T]) };
+        f(slice)
     })
 }
 
 /// Allocates `T` on stack space.
-pub fn alloca<T, R, F>(f: F) -> R
+#[inline]
+pub fn with<T, R, F>(f: F) -> R
 where
     F: FnOnce(&mut MaybeUninit<T>) -> R,
 {
-    with_alloca(size_of::<T>() + (align_of::<T>() - 1), |memory| unsafe {
-        let mut raw_memory = memory.as_mut_ptr();
-        if raw_memory as usize % align_of::<T>() != 0 {
-            raw_memory = raw_memory.add(align_of::<T>() - raw_memory as usize % align_of::<T>());
-        }
-        f(&mut *raw_memory.cast::<MaybeUninit<T>>())
+    with_slice(1, |slice| {
+        f(unsafe { &mut *(slice as *mut [MaybeUninit<T>] as *mut MaybeUninit<T>) })
     })
 }
 
-#[cfg(test)]
-mod tests;
+#[inline]
+pub fn with_zeroed<T, R, F>(f: F) -> R
+where
+    F: FnOnce(&mut MaybeUninit<T>) -> R,
+{
+    with(|data| {
+        unsafe {
+            core::ptr::write_bytes(data.as_mut_ptr(), 0, 1);
+        }
+
+        f(data)
+    })
+}
+
+#[inline]
+pub unsafe fn with_assume_init<T, R, F>(f: F) -> R
+where
+    F: FnOnce(&mut T) -> R,
+{
+    with(|data| f(unsafe { &mut *(data as *mut MaybeUninit<T> as *mut T) }))
+}
+
+#[inline]
+pub unsafe fn with_zeroed_assume_init<T, R, F>(f: F) -> R
+where
+    F: FnOnce(&mut T) -> R,
+{
+    with_zeroed(|data| f(unsafe { &mut *(data as *mut MaybeUninit<T> as *mut T) }))
+}
